@@ -39,16 +39,39 @@ confirm() {
   [[ "${answer:-$default}" == "s" || "${answer:-$default}" == "S" || "${answer:-$default}" == "y" || "${answer:-$default}" == "Y" ]]
 }
 
+# Determinar el prefijo de partición según el tipo de disco
+# NVMe → nvme0n1p1, SATA → sda1, VirtIO → vda1, MMC → mmcblk0p1
+part_name() {
+  local disk="$1" num="$2"
+  local base
+  base=$(basename "$disk")
+  if echo "$base" | grep -qP 'nvme\d+n\d+'; then
+    echo "${disk}p${num}"
+  elif echo "$base" | grep -qP 'mmcblk\d+'; then
+    echo "${disk}p${num}"
+  else
+    echo "${disk}${num}"
+  fi
+}
+
+# Listar particiones de un disco
+list_parts() {
+  local disk="$1"
+  local base
+  base=$(basename "$disk")
+  lsblk -n -o NAME "$disk" 2>/dev/null | grep -v "^${base}$" | grep "^${base}" || true
+}
+
 select_disk() {
   echo ""
   echo "  Discos disponibles:"
   echo ""
-  lsblk -d -o NAME,SIZE,MODEL -e 7,11 2>/dev/null | grep -v loop | while read -r line; do
+  lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 2>/dev/null | grep -v loop | while read -r line; do
     echo "    /dev/$line"
   done
   echo ""
   local disk
-  disk=$(ask "Selecciona el disco" "DISK" "/dev/nvme0n1")
+  disk=$(ask "Selecciona el disco" "DISK" "/dev/sda")
   [[ -b "$disk" ]] || bail "El disco $disk no existe"
   echo "$disk"
 }
@@ -82,7 +105,7 @@ FREE_SPACE=false
 
 if [[ $EXISTING_PARTITIONS -gt 0 ]]; then
   # Buscar ESP
-  for part in $(lsblk -n -o NAME "$DISK" 2>/dev/null | grep "^${DISK_NAME}p" | sort); do
+  for part in $(list_parts "$DISK" | sort); do
     fstype=$(lsblk -n -o FSTYPE "/dev/$part" 2>/dev/null)
     if [[ "$fstype" == "vfat" ]]; then
       # Verificar que sea una ESP (tiene /EFI)
@@ -103,7 +126,7 @@ if [[ $EXISTING_PARTITIONS -gt 0 ]]; then
   done
 
   # Verificar espacio libre
-  if parted -s "$DISK" print free 2>/dev/null | grep -q "Free Space"; then
+  if parted -s "$DISK" unit MB print free 2>/dev/null | grep -q "Free Space"; then
     FREE_SPACE=true
   fi
 fi
@@ -176,13 +199,13 @@ if $DUAL_BOOT; then
 
   info "Espacio libre detectado: ${FREE_START}MB → ${FREE_END}MB"
 
-  PART_NUM=$(( $(lsblk -n -o NAME "$DISK" 2>/dev/null | grep -c "^${DISK_NAME}p") + 1 ))
-  PART_LUKS="${DISK}p${PART_NUM}"
+  PART_NUM=$(list_parts "$DISK" | wc -l)
+  PART_NUM=$(( PART_NUM + 1 ))
+  PART_LUKS=$(part_name "$DISK" "$PART_NUM")
 
   parted -s "$DISK" mkpart primary "${FREE_START}MB" "${FREE_END}MB"
   sleep 2
-  partprobe "$DISK" 2>/dev/null || true
-  sleep 1
+  udevadm settle 2>/dev/null || sleep 2
 
   info "Partición LUKS creada: $PART_LUKS"
 else
@@ -194,20 +217,19 @@ else
   parted -s "$DISK" mkpart ESP fat32 1MB 501MB
   parted -s "$DISK" set 1 esp on
   sleep 1
-  ESP_PART="${DISK}p1"
+  ESP_PART=$(part_name "$DISK" 1)
   mkfs.vfat -F32 "$ESP_PART"
   info "ESP creada: $ESP_PART"
 
   # LUKS
-  DISK_END=$(parted -s "$DISK" unit MB print 2>/dev/null | grep "^ ${DISK_NAME}" | awk '{gsub("MB","",$3); print $3}' | tail -1)
-  if [[ -z "$DISK_END" ]]; then
-    DISK_END=$(blockdev --getsize64 "$DISK" | awk '{print $1/1024/1024}')
-  fi
+  DISK_BYTES=$(blockdev --getsize64 "$DISK")
+  DISK_END=$(echo "$DISK_BYTES" | awk '{printf "%.0f", $1/1024/1024}')
+  # Dejar 1MB de margen al final
+  DISK_END=$(( DISK_END - 1 ))
   parted -s "$DISK" mkpart primary 501MB "${DISK_END}MB"
   sleep 2
-  partprobe "$DISK" 2>/dev/null || true
-  sleep 1
-  PART_LUKS="${DISK}p2"
+  udevadm settle 2>/dev/null || sleep 2
+  PART_LUKS=$(part_name "$DISK" 2)
 
   info "Partición LUKS creada: $PART_LUKS"
 fi
