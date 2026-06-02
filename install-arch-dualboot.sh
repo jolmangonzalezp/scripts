@@ -45,9 +45,9 @@ part_name() {
   local disk="$1" num="$2"
   local base
   base=$(basename "$disk")
-  if echo "$base" | grep -qP 'nvme\d+n\d+'; then
+  if echo "$base" | grep -qE 'nvme[0-9]+n[0-9]+'; then
     echo "${disk}p${num}"
-  elif echo "$base" | grep -qP 'mmcblk\d+'; then
+  elif echo "$base" | grep -qE 'mmcblk[0-9]+'; then
     echo "${disk}p${num}"
   else
     echo "${disk}${num}"
@@ -63,13 +63,13 @@ list_parts() {
 }
 
 select_disk() {
-  echo ""
-  echo "  Discos disponibles:"
-  echo ""
+  echo "" >&2
+  echo "  Discos disponibles:" >&2
+  echo "" >&2
   lsblk -d -n -o NAME,SIZE,MODEL -e 7,11 2>/dev/null | grep -v loop | while read -r line; do
-    echo "    /dev/$line"
+    echo "    /dev/$line" >&2
   done
-  echo ""
+  echo "" >&2
   local disk
   disk=$(ask "Selecciona el disco" "DISK" "/dev/sda")
   [[ -b "$disk" ]] || bail "El disco $disk no existe"
@@ -177,10 +177,14 @@ done
 KEYBOARD=$(ask "Layout de teclado" "KEYBOARD" "la-latin1")
 TIMEZONE=$(ask "Zona horaria" "TIMEZONE" "America/Bogota")
 LOCALE=$(ask "Locale" "LOCALE" "es_CO.UTF-8")
-SWAP_SIZE=$(ask "Tamaño del swapfile" "SWAP_SIZE" "16G")
+CREATE_SWAP=false
+if confirm "¿Crear swapfile? (ZRAM ya está configurado)" "n"; then
+  CREATE_SWAP=true
+  SWAP_SIZE=$(ask "Tamaño del swapfile" "SWAP_SIZE" "16G")
+fi
 
 echo ""
-info "Resumen: hostname=$HOSTNAME user=$USERNAME locale=$LOCALE swap=$SWAP_SIZE"
+info "Resumen: hostname=$HOSTNAME user=$USERNAME locale=$LOCALE swap=${SWAP_SIZE:-ninguno}"
 
 # ── Particionado ──────────────────────────────────────────────────────────────
 title "Particionado"
@@ -283,7 +287,9 @@ mount -o subvol=@,$BTRFS_OPTS /dev/mapper/cryptroot /mnt
 mount --mkdir -o subvol=@home,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/home
 mount --mkdir -o subvol=@snapshots,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/.snapshots
 mount --mkdir -o subvol=@var_log,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/var/log
-mount --mkdir -o subvol=@swap,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/swap
+if $CREATE_SWAP; then
+  mount --mkdir -o subvol=@swap,$BTRFS_OPTS /dev/mapper/cryptroot /mnt/swap
+fi
 
 mount "$ESP_PART" /mnt/boot
 
@@ -292,15 +298,17 @@ info "Particiones montadas"
 # ── SWAP ──────────────────────────────────────────────────────────────────────
 title "Swapfile"
 
-# Convertir SWAP_SIZE a bytes para dd
-SWAP_BYTES=$(numfmt --from=iec "$SWAP_SIZE" 2>/dev/null || echo "16G")
-truncate -s 0 /mnt/swap/.swapfile
-chattr +C /mnt/swap/.swapfile
-fallocate -l "$SWAP_BYTES" /mnt/swap/.swapfile || dd if=/dev/zero of=/mnt/swap/.swapfile bs=1M count=$(( ${SWAP_SIZE%G} * 1024 )) status=progress
-chmod 600 /mnt/swap/.swapfile
-mkswap /mnt/swap/.swapfile
-
-info "Swapfile creado ($SWAP_SIZE)"
+if $CREATE_SWAP; then
+  SWAP_BYTES=$(numfmt --from=iec "$SWAP_SIZE" 2>/dev/null || echo "16G")
+  truncate -s 0 /mnt/swap/.swapfile
+  chattr +C /mnt/swap/.swapfile
+  fallocate -l "$SWAP_BYTES" /mnt/swap/.swapfile || dd if=/dev/zero of=/mnt/swap/.swapfile bs=1M count=$(( ${SWAP_SIZE%G} * 1024 )) status=progress
+  chmod 600 /mnt/swap/.swapfile
+  mkswap /mnt/swap/.swapfile
+  info "Swapfile creado ($SWAP_SIZE)"
+else
+  info "Swapfile omitido — usando ZRAM"
+fi
 
 # ── Pacstrap ──────────────────────────────────────────────────────────────────
 title "Instalando base"
@@ -336,8 +344,8 @@ title "Configurando sistema"
 
 genfstab -L /mnt >> /mnt/etc/fstab
 
-# Arreglar /swap/.swapfile en fstab si no se generó bien
-if ! grep -q "swapfile" /mnt/etc/fstab 2>/dev/null; then
+# Arreglar /swap/.swapfile en fstab si se creó
+if $CREATE_SWAP && ! grep -q "swapfile" /mnt/etc/fstab 2>/dev/null; then
   echo "/swap/.swapfile none swap defaults 0 0" >> /mnt/etc/fstab
 fi
 
